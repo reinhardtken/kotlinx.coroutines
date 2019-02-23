@@ -113,7 +113,18 @@ public abstract class AbstractCoroutine<in T>(
      * Completes execution of this with coroutine with the specified result.
      */
     public final override fun resumeWith(result: Result<T>) {
-        makeCompletingOnce(result.toState(), defaultResumeMode)
+        val proposedUpdate = result.toState()
+        if (makeCompleting(proposedUpdate, defaultResumeMode) == COMPLETING_ALREADY_COMPLETING) {
+            /**
+             * This happens when coroutine has handlers installed via [CoroutineBuilder].
+             * It was already completing and now its final state was determined.
+             * It must be still at incomplete state by now, otherwise we are witnessing a
+             * repeated invocation of [resumeWith].
+             */
+            val state = this.state as? Incomplete
+                ?: error("resumeWith in a complete state $state. Repeated invocation?")
+            updateToFinalState(state, proposedUpdate, defaultResumeMode)
+        }
     }
 
     internal final override fun handleOnCompletionException(exception: Throwable) {

@@ -104,7 +104,7 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
          + notifyCancelling (invoke all cancelling listeners -- cancel all children, suspended functions resume with exception)
          + cancelParent (rootCause of cancellation is communicated to the parent, parent is cancelled, too)
          ~ waits for completion of coroutine body
-         >> makeCompleting / makeCompletingOnce invoked
+         >> makeCompleting invoked
        ## COMPLETING: state is Finishing, state.isCompleting == true
         ------ new children are not admitted anymore, attachChild returns NonDisposableHandle
          ~ waits for children
@@ -191,7 +191,8 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
 
     // Finalizes Finishing -> Completed (terminal state) transition.
     // ## IMPORTANT INVARIANT: Only one thread can be concurrently invoking this method.
-    private fun tryFinalizeFinishingState(state: Finishing, proposedUpdate: Any?, mode: Int): Boolean {
+    // Returns the resulting final state
+    private fun finalizeFinishingState(state: Finishing, proposedUpdate: Any?): Any? {
         /*
          * Note: proposed state can be Incompleted, e.g.
          * async {
@@ -203,32 +204,39 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
         require(state.isCompleting) // consistency check -- must be marked as completing
         val proposedException = (proposedUpdate as? CompletedExceptionally)?.cause
         // Create the final exception and seal the state so that no more exceptions can be added
-        var suppressed = false
+        var suppressed = false // todo:???
         val finalException = synchronized(state) {
             val exceptions = state.sealLocked(proposedException)
             val finalCause = getFinalRootCause(state, exceptions)
             // Report suppressed exceptions if initial cause doesn't match final cause (due to JCE unwrapping)
-            if (finalCause != null) suppressed = suppressExceptions(finalCause, exceptions) || finalCause !== state.rootCause
+            if (finalCause != null) suppressed =
+                suppressExceptions(finalCause, exceptions) || finalCause !== state.rootCause
             finalCause
         }
-        // Create the final state object
-        val finalState = when {
+        // Create and return the final state object
+       return when {
             // was not cancelled (no exception) -> use proposed update value
             finalException == null -> proposedUpdate
             // small optimization when we can used proposeUpdate object as is on cancellation
             finalException === proposedException -> proposedUpdate
             // cancelled job final state
             else -> CompletedExceptionally(finalException)
-        }
+       }
+    }
+
+    internal fun updateToFinalState(state: Incomplete, finalState: Any?, mode: Int) {
+        val finalException = (finalState as? CompletedExceptionally)?.cause
         // Now handle exception if parent can't handle it
         if (finalException != null && !cancelParent(finalException)) {
             handleJobException(finalException)
         }
         // Then CAS to completed state -> it must succeed
-        require(_state.compareAndSet(state, finalState.boxIncomplete())) { "Unexpected state: ${_state.value}, expected: $state, update: $finalState" }
+        require(_state.compareAndSet(state, finalState.boxIncomplete())) {
+            "Unexpected state: ${_state.value}, expected: $state, update: $finalState"
+        }
         // And process all post-completion actions
-        completeStateFinalization(state, finalState, mode, suppressed)
-        return true
+        val suppressed = false // todo
+        completeStateFinalization(state, finalState, mode, false)
     }
 
     private fun getFinalRootCause(state: Finishing, exceptions: List<Throwable>): Throwable? {
@@ -602,7 +610,7 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
                 return false // already completed/completing, do not even propose update
             }
             val proposedUpdate = CompletedExceptionally(createCauseException(cause))
-            when (tryMakeCompleting(state, proposedUpdate, mode = MODE_ATOMIC_DEFAULT)) {
+            when (tryMakeCompleting(state, proposedUpdate, MODE_ATOMIC_DEFAULT, FinalState)) {
                 COMPLETING_ALREADY_COMPLETING -> return false
                 COMPLETING_COMPLETED, COMPLETING_WAITING_CHILDREN -> return true
                 COMPLETING_RETRY -> return@loopOnState
@@ -671,7 +679,7 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
                         if (tryMakeCancelling(state, causeException)) return true
                     } else {
                         // non active state starts completing
-                        when (tryMakeCompleting(state, CompletedExceptionally(causeException), mode = MODE_ATOMIC_DEFAULT)) {
+                        when (tryMakeCompleting(state, CompletedExceptionally(causeException),MODE_ATOMIC_DEFAULT, FinalState)) {
                             COMPLETING_ALREADY_COMPLETING -> error("Cannot happen in $state")
                             COMPLETING_COMPLETED, COMPLETING_WAITING_CHILDREN -> return true // ok
                             COMPLETING_RETRY -> return@loopOnState
@@ -713,52 +721,41 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
     }
 
     /**
-     * This function is used by [CompletableDeferred.complete] (and exceptionally) and by [JobImpl.cancel].
-     * It returns `false` on repeated invocation (when this job is already completing).
+     * This function makes this job completing and returns one of three results:
+     * * [COMPLETING_ALREADY_COMPLETING] - if it was already completing before invocation.
+     * * [COMPLETING_COMPLETED] - if it was made completed.
+     * * [COMPLETING_WAITING_CHILDREN] - if it was completing and is waiting for children.
      *
      * @suppress **This is unstable API and it is subject to change.**
      */
-    internal fun makeCompleting(proposedUpdate: Any?): Boolean = loopOnState { state ->
-        when (tryMakeCompleting(state, proposedUpdate, mode = MODE_ATOMIC_DEFAULT)) {
-            COMPLETING_ALREADY_COMPLETING -> return false
-            COMPLETING_COMPLETED, COMPLETING_WAITING_CHILDREN -> return true
-            COMPLETING_RETRY -> return@loopOnState
-            else -> error("unexpected result")
-        }
+    internal fun makeCompleting(proposedUpdate: Any?, mode: Int): Int = loopOnState { state ->
+        val result = tryMakeCompleting(state, proposedUpdate, mode, FinalState)
+        if (result != COMPLETING_RETRY) return result
     }
 
-    /**
-     * This function is used by [AbstractCoroutine.resume].
-     * It throws exception on repeated invocation (when this job is already completing).
-     *
-     * Returns:
-     * * `true` if state was updated to completed/cancelled;
-     * * `false` if made completing or it is cancelling and is waiting for children.
-     *
-     * @throws IllegalStateException if job is already complete or completing
-     * @suppress **This is unstable API and it is subject to change.**
-     */
-    internal fun makeCompletingOnce(proposedUpdate: Any?, mode: Int): Boolean = loopOnState { state ->
-        when (tryMakeCompleting(state, proposedUpdate, mode)) {
-            COMPLETING_ALREADY_COMPLETING -> throw IllegalStateException("Job $this is already complete or completing, " +
-                "but is being completed with $proposedUpdate", proposedUpdate.exceptionOrNull)
-            COMPLETING_COMPLETED -> return true
-            COMPLETING_WAITING_CHILDREN -> return false
-            COMPLETING_RETRY -> return@loopOnState
-            else -> error("unexpected result")
-        }
-    }
-
-    private fun tryMakeCompleting(state: Any?, proposedUpdate: Any?, mode: Int): Int {
-        if (state !is Incomplete)
-            return COMPLETING_ALREADY_COMPLETING
+    // Returns one of COMPLETING_XXX values
+    private fun tryMakeCompleting(
+        state: Any?,
+        proposedUpdate: Any?,
+        mode: Int,
+        completer: StateCompleter
+    ): Int {
+        if (state !is Incomplete) return COMPLETING_ALREADY_COMPLETING
         /*
-         * FAST PATH -- no children to wait for && simple state (no list) && not cancelling => can complete immediately
+         * FAST PATH to complete immediately when all of the following is true:
+         *  1) no children to wait for
+         *  2) simple state (no list)
+         *  3) not cancelling
+         *  4) default completer instance (FinalState)
          * Cancellation (failures) always have to go through Finishing state to serialize exception handling.
          * Otherwise, there can be a race between (completed state -> handled exception and newly attached child/join)
          * which may miss unhandled exception.
          */
-        if ((state is Empty || state is JobNode<*>) && state !is ChildHandleNode && proposedUpdate !is CompletedExceptionally) {
+        if ((state is Empty || state is JobNode<*>) &&
+            state !is ChildHandleNode &&
+            proposedUpdate !is CompletedExceptionally &&
+            completer === FinalState
+        ) {
             if (!tryFinalizeSimpleState(state, proposedUpdate, mode)) return COMPLETING_RETRY
             return COMPLETING_COMPLETED
         }
@@ -789,17 +786,16 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
             // If it just becomes cancelling --> must process cancelling notifications
             notifyRootCause = finishing.rootCause.takeIf { !wasCancelling }
         }
-        // process cancelling notification here -- it cancels all the children _before_ we start to to wait them (sic!!!)
+        // process cancelling notification here -- it cancels all the children _before_ we start to wait them (sic!!!)
         notifyRootCause?.let { notifyCancelling(list, it) }
         // now wait for children
         val child = firstChild(state)
-        if (child != null && tryWaitForChild(finishing, child, proposedUpdate))
+        if (child != null && tryWaitForChild(finishing, child, proposedUpdate, completer))
             return COMPLETING_WAITING_CHILDREN
-        // otherwise -- we have not children left (all were already cancelled?)
-        if (tryFinalizeFinishingState(finishing, proposedUpdate, mode))
-            return COMPLETING_COMPLETED
-        // otherwise retry
-        return COMPLETING_RETRY
+        // otherwise -- we have no children left (all were already cancelled?)
+        val finalState = finalizeFinishingState(finishing, proposedUpdate)
+        completer.complete(this, finishing, finalState, mode)
+        return COMPLETING_COMPLETED
     }
 
     private val Any?.exceptionOrNull: Throwable?
@@ -810,25 +806,36 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
 
     // return false when there is no more incomplete children to wait
     // ## IMPORTANT INVARIANT: Only one thread can be concurrently invoking this method.
-    private tailrec fun tryWaitForChild(state: Finishing, child: ChildHandleNode, proposedUpdate: Any?): Boolean {
+    private tailrec fun tryWaitForChild(
+        state: Finishing,
+        child: ChildHandleNode,
+        proposedUpdate: Any?,
+        completer: StateCompleter
+    ): Boolean {
         val handle = child.childJob.invokeOnCompletion(
             invokeImmediately = false,
-            handler = ChildCompletion(this, state, child, proposedUpdate).asHandler
+            handler = ChildCompletion(this, state, child, proposedUpdate, completer).asHandler
         )
         if (handle !== NonDisposableHandle) return true // child is not complete and we've started waiting for it
         val nextChild = child.nextChild() ?: return false
-        return tryWaitForChild(state, nextChild, proposedUpdate)
+        return tryWaitForChild(state, nextChild, proposedUpdate, completer)
     }
 
     // ## IMPORTANT INVARIANT: Only one thread can be concurrently invoking this method.
-    private fun continueCompleting(state: Finishing, lastChild: ChildHandleNode, proposedUpdate: Any?) {
+    private fun continueCompleting(
+        state: Finishing,
+        lastChild: ChildHandleNode,
+        proposedUpdate: Any?,
+        completer: StateCompleter
+    ) {
         require(this.state === state) // consistency check -- it cannot change while we are waiting for children
         // figure out if we need to wait for next child
         val waitChild = lastChild.nextChild()
         // try wait for next child
-        if (waitChild != null && tryWaitForChild(state, waitChild, proposedUpdate)) return // waiting for next child
-        // no more children to wait -- try update state
-        if (tryFinalizeFinishingState(state, proposedUpdate, MODE_ATOMIC_DEFAULT)) return
+        if (waitChild != null && tryWaitForChild(state, waitChild, proposedUpdate, completer)) return // waiting for next child
+        // no more children to wait -- finalize state
+        val finalState = finalizeFinishingState(state, proposedUpdate)
+        completer.complete(this, state, finalState, MODE_ATOMIC_DEFAULT)
     }
 
     private fun LockFreeLinkedListNode.nextChild(): ChildHandleNode? {
@@ -1024,10 +1031,11 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
         private val parent: JobSupport,
         private val state: Finishing,
         private val child: ChildHandleNode,
-        private val proposedUpdate: Any?
+        private val proposedUpdate: Any?,
+        private val completer: StateCompleter
     ) : JobNode<Job>(child.childJob) {
         override fun invoke(cause: Throwable?) {
-            parent.continueCompleting(state, child, proposedUpdate)
+            parent.continueCompleting(state, child, proposedUpdate, completer)
         }
         override fun toString(): String =
             "ChildCompletion[$child, $proposedUpdate]"
@@ -1150,7 +1158,52 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
         else
             block.startCoroutineCancellable(state.unboxState() as T, select.completion)
     }
+
+    private abstract class StateCompleter {
+        abstract fun complete(job: JobSupport, state: Incomplete, finalState: Any?, mode: Int)
+    }
+
+    private object FinalState : StateCompleter() {
+        override fun complete(job: JobSupport, state: Incomplete, finalState: Any?, mode: Int) =
+            job.updateToFinalState(state, finalState, mode)
+    }
+
+    private class ResumeWithState(private val cont: Continuation<Any?>) : StateCompleter() {
+        override fun complete(job: JobSupport, state: Incomplete, finalState: Any?, mode: Int) =
+            cont.resume(finalState)
+    }
+
+    /**
+     * Marks this job as completing, waits for all children, seals [Finishing] state (so that no more
+     * exception will be accepted), and returns the resulting final state of the job.
+     * It is quite optimized, with non-suspending fast-path when all children are already complete.
+     * This is _non-cancellable_ suspending function.
+     */
+    internal suspend fun awaitFinalStateCompletion(proposedUpdate: Any?): Any? =
+        suspendCoroutine sc@ { cont ->
+            /*
+             * Here we rely on SafeContinuation in suspendCoroutine to handle cont.resume from inside of
+             * ResumeWithState(cont) in cases where there is nothing to actually wait for.
+             * It avoids extra avoid dispatching in those cases.
+             */
+            loopOnState { state ->
+                // Note: mode is not used by ResumeWithState implementation of StateCompleter, so it is set to zero
+                when (tryMakeCompleting(state, proposedUpdate, 0, ResumeWithState(cont))) {
+                    COMPLETING_ALREADY_COMPLETING -> {
+                        cont.resume(proposedUpdate)
+                        return@sc
+                    }
+                    COMPLETING_WAITING_CHILDREN, COMPLETING_COMPLETED -> return@sc
+                    COMPLETING_RETRY -> return@loopOnState
+                    else -> error("unexpected result")
+                }
+            }
+        }
 }
+
+// Can be only invoked in the context of JobSupport (will not work with other Job implementations)
+internal suspend fun awaitFinalStateCompletion(proposedUpdate: Any?): Any? =
+    (coroutineContext[Job] as JobSupport).awaitFinalStateCompletion(proposedUpdate)
 
 /*
  * Class to represent object as the final state of the Job
@@ -1161,10 +1214,10 @@ internal fun Any?.unboxState(): Any? = (this as? IncompleteStateBox)?.state ?: t
 
 // --------------- helper classes & constants for job implementation
 
-private const val COMPLETING_ALREADY_COMPLETING = 0
-private const val COMPLETING_COMPLETED = 1
-private const val COMPLETING_WAITING_CHILDREN = 2
-private const val COMPLETING_RETRY = 3
+internal const val COMPLETING_RETRY = 0
+internal const val COMPLETING_ALREADY_COMPLETING = 1
+internal const val COMPLETING_COMPLETED = 2
+internal const val COMPLETING_WAITING_CHILDREN = 3
 
 private const val RETRY = -1
 private const val FALSE = 0
@@ -1187,9 +1240,11 @@ internal open class JobImpl(parent: Job?) : JobSupport(true), CompletableJob {
     override val cancelsParent: Boolean get() = true
     override val onCancelComplete get() = true
     override val handlesException: Boolean get() = false
-    override fun complete() = makeCompleting(Unit)
+
+    override fun complete() =
+        makeCompleting(Unit, MODE_ATOMIC_DEFAULT) != COMPLETING_ALREADY_COMPLETING
     override fun completeExceptionally(exception: Throwable): Boolean =
-        makeCompleting(CompletedExceptionally(exception))
+        makeCompleting(CompletedExceptionally(exception), MODE_ATOMIC_DEFAULT) != COMPLETING_ALREADY_COMPLETING
 }
 
 // -------- invokeOnCompletion nodes
